@@ -6,7 +6,7 @@ use crate::{
 };
 use agent_settings::AgentSettings;
 use anyhow::{Context as _, Result, anyhow};
-use buffer_diff::{BufferDiff, DiffHunkSecondaryStatus};
+use buffer_diff::{BufferDiff, DiffHunk, DiffHunkSecondaryStatus};
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, SelectionEffects, SplittableEditor,
@@ -81,6 +81,7 @@ pub struct ProjectDiff {
     focus_handle: FocusHandle,
     pending_scroll: Option<PathKey>,
     review_comment_count: usize,
+    ignore_whitespace_only_changes: bool,
     _task: Task<Result<()>>,
     _subscription: Subscription,
 }
@@ -332,6 +333,16 @@ impl ProjectDiff {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        Self::deploy_at_with_ignore_whitespace_only_changes(workspace, entry, None, window, cx);
+    }
+
+    pub fn deploy_at_with_ignore_whitespace_only_changes(
+        workspace: &mut Workspace,
+        entry: Option<GitStatusEntry>,
+        ignore_whitespace_only_changes: Option<bool>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         telemetry::event!(
             "Git Diff Opened",
             source = if entry.is_some() {
@@ -382,6 +393,16 @@ impl ProjectDiff {
             }
         }
 
+        if let Some(ignore_whitespace_only_changes) = ignore_whitespace_only_changes {
+            project_diff.update(cx, |project_diff, cx| {
+                project_diff.set_ignore_whitespace_only_changes(
+                    ignore_whitespace_only_changes,
+                    window,
+                    cx,
+                );
+            });
+        }
+
         if let Some(entry) = entry {
             project_diff.update(cx, |project_diff, cx| {
                 project_diff.move_to_entry(entry, window, cx);
@@ -426,6 +447,27 @@ impl ProjectDiff {
                 editor.request_autoscroll(Autoscroll::fit(), cx);
             })
         })
+    }
+
+    pub(crate) fn ignore_whitespace_only_changes(&self) -> bool {
+        self.ignore_whitespace_only_changes
+    }
+
+    pub(crate) fn set_ignore_whitespace_only_changes(
+        &mut self,
+        ignore_whitespace_only_changes: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ignore_whitespace_only_changes == ignore_whitespace_only_changes {
+            return;
+        }
+
+        self.ignore_whitespace_only_changes = ignore_whitespace_only_changes;
+        self._task = cx.spawn_in(window, async move |this, cx| {
+            ProjectDiff::refresh(this, RefreshReason::StatusesChanged, cx).await
+        });
+        cx.notify();
     }
 
     #[cfg(test)]
@@ -575,16 +617,14 @@ impl ProjectDiff {
             },
         );
 
-        let mut was_sort_by_path = GitPanelSettings::get_global(cx).sort_by_path;
-        let mut was_collapse_untracked_diff =
-            GitPanelSettings::get_global(cx).collapse_untracked_diff;
+        let git_panel_refresh_settings = |cx: &App| {
+            let settings = GitPanelSettings::get_global(cx);
+            (settings.sort_by_path, settings.collapse_untracked_diff)
+        };
+        let mut previous_git_panel_refresh_settings = git_panel_refresh_settings(cx);
         cx.observe_global_in::<SettingsStore>(window, move |this, window, cx| {
-            let is_sort_by_path = GitPanelSettings::get_global(cx).sort_by_path;
-            let is_collapse_untracked_diff =
-                GitPanelSettings::get_global(cx).collapse_untracked_diff;
-            if is_sort_by_path != was_sort_by_path
-                || is_collapse_untracked_diff != was_collapse_untracked_diff
-            {
+            let current_git_panel_refresh_settings = git_panel_refresh_settings(cx);
+            if current_git_panel_refresh_settings != previous_git_panel_refresh_settings {
                 this._task = {
                     window.spawn(cx, {
                         let this = cx.weak_entity();
@@ -592,8 +632,7 @@ impl ProjectDiff {
                     })
                 }
             }
-            was_sort_by_path = is_sort_by_path;
-            was_collapse_untracked_diff = is_collapse_untracked_diff;
+            previous_git_panel_refresh_settings = current_git_panel_refresh_settings;
         })
         .detach();
 
@@ -612,6 +651,7 @@ impl ProjectDiff {
             buffer_diff_subscriptions: Default::default(),
             pending_scroll: None,
             review_comment_count: 0,
+            ignore_whitespace_only_changes: false,
             _task: task,
             _subscription: Subscription::join(
                 branch_diff_subscription,
@@ -838,13 +878,19 @@ impl ProjectDiff {
 
         let snapshot = buffer.read(cx).snapshot();
         let diff_snapshot = diff.read(cx).snapshot(cx);
+        let ignore_whitespace_only_changes = self.ignore_whitespace_only_changes;
 
         let excerpt_ranges = {
+            let base_text = diff_snapshot.base_text();
             let diff_hunk_ranges = diff_snapshot
                 .hunks_intersecting_range(
                     Anchor::min_max_range_for_buffer(snapshot.remote_id()),
                     &snapshot,
                 )
+                .filter(|diff_hunk| {
+                    !ignore_whitespace_only_changes
+                        || !is_whitespace_only_diff_hunk(diff_hunk, &snapshot, base_text)
+                })
                 .map(|diff_hunk| diff_hunk.buffer_range.to_point(&snapshot));
             let conflicts = conflict_addon
                 .conflict_set(snapshot.remote_id())
@@ -870,7 +916,11 @@ impl ProjectDiff {
                 path_key.clone(),
                 buffer,
                 excerpt_ranges,
-                multibuffer_context_lines(cx),
+                if ignore_whitespace_only_changes {
+                    0
+                } else {
+                    multibuffer_context_lines(cx)
+                },
                 diff,
                 cx,
             );
@@ -1050,6 +1100,21 @@ impl ProjectDiff {
             })
             .collect()
     }
+}
+
+pub(crate) fn is_whitespace_only_diff_hunk(
+    diff_hunk: &DiffHunk,
+    buffer: &language::BufferSnapshot,
+    base_text: &language::BufferSnapshot,
+) -> bool {
+    base_text
+        .text_for_range(diff_hunk.diff_base_byte_range.clone())
+        .flat_map(|chunk| chunk.chars())
+        .filter(|character| !character.is_whitespace())
+        .eq(buffer
+            .text_for_range(diff_hunk.buffer_range.clone())
+            .flat_map(|chunk| chunk.chars())
+            .filter(|character| !character.is_whitespace()))
 }
 
 fn sort_prefix(repo: &Repository, repo_path: &RepoPath, status: FileStatus, cx: &App) -> u64 {
@@ -1549,6 +1614,36 @@ impl ProjectDiffToolbar {
             })
             .ok();
     }
+
+    fn toggle_ignore_whitespace_only_changes(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(project_diff) = self.project_diff(cx) {
+            let ignore_whitespace_only_changes =
+                !project_diff.read(cx).ignore_whitespace_only_changes();
+            project_diff.update(cx, |project_diff, cx| {
+                project_diff.set_ignore_whitespace_only_changes(
+                    ignore_whitespace_only_changes,
+                    window,
+                    cx,
+                );
+            });
+            self.workspace
+                .update(cx, |workspace, cx| {
+                    if let Some(git_panel) = workspace.panel::<GitPanel>(cx) {
+                        git_panel.update(cx, |git_panel, cx| {
+                            git_panel.set_ignore_whitespace_only_changes(
+                                ignore_whitespace_only_changes,
+                                cx,
+                            );
+                        });
+                    }
+                })
+                .ok();
+        }
+    }
 }
 
 impl EventEmitter<ToolbarItemEvent> for ProjectDiffToolbar {}
@@ -1596,6 +1691,7 @@ impl Render for ProjectDiffToolbar {
         };
         let focus_handle = project_diff.focus_handle(cx);
         let button_states = project_diff.read(cx).button_states(cx);
+        let ignore_whitespace_only_changes = project_diff.read(cx).ignore_whitespace_only_changes();
         let review_count = project_diff.read(cx).total_review_comment_count();
 
         h_group_xl()
@@ -1659,6 +1755,16 @@ impl Render for ProjectDiffToolbar {
             // support "undo" for staging so we need a way to go back.
             .child(
                 h_group_sm()
+                    .child(
+                        IconButton::new("ignore-whitespace-only-changes", IconName::EyeOff)
+                            .shape(ui::IconButtonShape::Square)
+                            .toggle_state(ignore_whitespace_only_changes)
+                            .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                            .tooltip(Tooltip::text("Hide whitespace-only changes"))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_ignore_whitespace_only_changes(window, cx)
+                            })),
+                    )
                     .child(
                         IconButton::new("up", IconName::ArrowUp)
                             .shape(ui::IconButtonShape::Square)
@@ -1994,6 +2100,93 @@ mod tests {
             editor::init(cx);
             crate::init(cx);
         });
+    }
+
+    #[gpui::test]
+    async fn test_whitespace_only_diff_hunk_detection(cx: &mut TestAppContext) {
+        let base_text = cx.update(|cx| {
+            cx.new(|cx| Buffer::local("one\ntwo\nthree\n", cx))
+                .read(cx)
+                .snapshot()
+        });
+        let whitespace_only_buffer = cx.update(|cx| {
+            cx.new(|cx| Buffer::local("one\n    two\nthree\n", cx))
+                .read(cx)
+                .snapshot()
+        });
+        let changed_buffer = cx.update(|cx| {
+            cx.new(|cx| Buffer::local("one\n    TWO\nthree\n", cx))
+                .read(cx)
+                .snapshot()
+        });
+        let hunk = DiffHunk {
+            range: language::Point::new(1, 0)..language::Point::new(2, 0),
+            buffer_range: whitespace_only_buffer.anchor_before(language::Point::new(1, 0))
+                ..whitespace_only_buffer.anchor_before(language::Point::new(2, 0)),
+            diff_base_byte_range: "one\n".len().."one\ntwo\n".len(),
+            secondary_status: DiffHunkSecondaryStatus::NoSecondaryHunk,
+            buffer_word_diffs: Vec::new(),
+            base_word_diffs: Vec::new(),
+        };
+
+        assert!(is_whitespace_only_diff_hunk(
+            &hunk,
+            &whitespace_only_buffer,
+            &base_text
+        ));
+
+        let hunk = DiffHunk {
+            buffer_range: changed_buffer.anchor_before(language::Point::new(1, 0))
+                ..changed_buffer.anchor_before(language::Point::new(2, 0)),
+            ..hunk
+        };
+        assert!(!is_whitespace_only_diff_hunk(
+            &hunk,
+            &changed_buffer,
+            &base_text
+        ));
+    }
+
+    #[gpui::test]
+    async fn test_ignore_whitespace_only_changes_filters_project_diff(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                "foo.txt": "one\n    two\nthree\nFOUR\n",
+            }),
+        )
+        .await;
+        fs.set_head_and_index_for_repo(
+            path!("/project/.git").as_ref(),
+            &[("foo.txt", "one\ntwo\nthree\nfour\n".into())],
+        );
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |mw, _| mw.workspace().clone());
+        let diff = cx.new_window_entity(|window, cx| {
+            ProjectDiff::new(project.clone(), workspace, window, cx)
+        });
+        diff.update(cx, |diff, _| {
+            diff.ignore_whitespace_only_changes = true;
+        });
+        cx.run_until_parked();
+
+        let editor = diff.read_with(cx, |diff, cx| diff.editor.read(cx).rhs_editor().clone());
+        assert_state_with_diff(
+            &editor,
+            cx,
+            &"
+                - ˇfour
+                + FOUR
+            "
+            .unindent(),
+        );
     }
 
     #[gpui::test]

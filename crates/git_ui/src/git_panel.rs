@@ -697,6 +697,7 @@ pub struct GitPanel {
     commit_history_shas: Option<Vec<Oid>>,
     focused_history_entry: Option<usize>,
     history_keyboard_nav: bool,
+    ignore_whitespace_only_changes: bool,
     _repo_subscriptions: Vec<Subscription>,
 
     _settings_subscription: Subscription,
@@ -894,6 +895,7 @@ impl GitPanel {
                 commit_history_shas: None,
                 focused_history_entry: None,
                 history_keyboard_nav: false,
+                ignore_whitespace_only_changes: false,
                 _repo_subscriptions: Vec::new(),
                 _settings_subscription,
                 git_access: GitAccess::Yes,
@@ -906,6 +908,39 @@ impl GitPanel {
 
     pub fn entry_by_path(&self, path: &RepoPath) -> Option<usize> {
         self.entries_indices.get(path).copied()
+    }
+
+    pub(crate) fn set_ignore_whitespace_only_changes(
+        &mut self,
+        ignore_whitespace_only_changes: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.ignore_whitespace_only_changes != ignore_whitespace_only_changes {
+            self.ignore_whitespace_only_changes = ignore_whitespace_only_changes;
+            cx.notify();
+        }
+    }
+
+    fn toggle_ignore_whitespace_only_changes(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ignore_whitespace_only_changes = !self.ignore_whitespace_only_changes;
+        self.set_ignore_whitespace_only_changes(ignore_whitespace_only_changes, cx);
+
+        maybe!({
+            let workspace = self.workspace.upgrade()?;
+            let project_diff = workspace.read(cx).item_of_type::<ProjectDiff>(cx)?;
+            project_diff.update(cx, |project_diff, cx| {
+                project_diff.set_ignore_whitespace_only_changes(
+                    ignore_whitespace_only_changes,
+                    window,
+                    cx,
+                );
+            });
+            Some(())
+        });
     }
 
     pub fn select_entry_by_path(
@@ -1371,9 +1406,16 @@ impl GitPanel {
                 return None;
             };
 
+            let ignore_whitespace_only_changes = self.ignore_whitespace_only_changes;
             self.workspace
                 .update(cx, |workspace, cx| {
-                    ProjectDiff::deploy_at(workspace, Some(entry.clone()), window, cx);
+                    ProjectDiff::deploy_at_with_ignore_whitespace_only_changes(
+                        workspace,
+                        Some(entry.clone()),
+                        Some(ignore_whitespace_only_changes),
+                        window,
+                        cx,
+                    );
                 })
                 .ok();
             self.focus_handle.focus(window, cx);
@@ -4537,15 +4579,35 @@ impl GitPanel {
                             &Diff,
                             &self.focus_handle,
                         ))
-                        .on_click(|_, _, cx| {
-                            cx.defer(|cx| {
-                                cx.dispatch_action(&Diff);
-                            })
-                        }),
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            let ignore_whitespace_only_changes =
+                                this.ignore_whitespace_only_changes;
+                            this.workspace
+                                .update(cx, |workspace, cx| {
+                                    ProjectDiff::deploy_at_with_ignore_whitespace_only_changes(
+                                        workspace,
+                                        None,
+                                        Some(ignore_whitespace_only_changes),
+                                        window,
+                                        cx,
+                                    );
+                                })
+                                .ok();
+                        })),
                 )
                 .child(
                     h_flex()
                         .gap_1()
+                        .child(
+                            IconButton::new("ignore-whitespace-only-changes", IconName::EyeOff)
+                                .icon_size(IconSize::Small)
+                                .toggle_state(self.ignore_whitespace_only_changes)
+                                .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                                .tooltip(Tooltip::text("Hide whitespace-only changes"))
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_ignore_whitespace_only_changes(window, cx);
+                                })),
+                        )
                         .child(self.render_ellipsis_menu("overflow_menu"))
                         .child(
                             Button::new("stage_unstage_all", text)

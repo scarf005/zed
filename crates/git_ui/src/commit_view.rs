@@ -1,5 +1,5 @@
 use anyhow::{Context as _, Result};
-use buffer_diff::BufferDiff;
+use buffer_diff::{BufferDiff, DiffHunk};
 use collections::HashMap;
 use editor::{
     Addon, Editor, EditorEvent, EditorSettings, MultiBuffer, SplittableEditor,
@@ -44,8 +44,7 @@ use workspace::{
     searchable::SearchableItemHandle,
 };
 
-use crate::commit_tooltip::CommitAvatar;
-use crate::git_panel::GitPanel;
+use crate::{commit_tooltip::CommitAvatar, git_panel::GitPanel};
 
 actions!(
     git,
@@ -74,14 +73,18 @@ pub fn init(cx: &mut App) {
 
 pub struct CommitView {
     commit: CommitDetails,
+    commit_diff: CommitDiff,
     editor: Entity<SplittableEditor>,
     message: Entity<Markdown>,
     message_expanded: bool,
     stash: Option<usize>,
     multibuffer: Entity<MultiBuffer>,
+    project: Entity<Project>,
     repository: Entity<Repository>,
     workspace: WeakEntity<Workspace>,
     remote: Option<GitRemote>,
+    ignore_whitespace_only_changes: bool,
+    build_diff_task: Task<Result<()>>,
 }
 
 struct GitBlob {
@@ -281,15 +284,63 @@ impl CommitView {
 
             editor
         });
-        let commit_sha = Arc::<str>::from(commit.sha.as_ref());
+        let build_diff_task = Self::spawn_build_diff_task(
+            commit_diff.clone(),
+            repository.clone(),
+            project.clone(),
+            Arc::from(commit.sha.as_ref()),
+            false,
+            window,
+            cx,
+        );
 
+        let snapshot = repository.read(cx).snapshot();
+        let remote_url = snapshot
+            .remote_upstream_url
+            .as_ref()
+            .or(snapshot.remote_origin_url.as_ref());
+
+        let remote = remote_url.and_then(|url| {
+            let provider_registry = GitHostingProviderRegistry::default_global(cx);
+            parse_git_remote_url(provider_registry, url).map(|(host, parsed)| GitRemote {
+                host,
+                owner: parsed.owner.into(),
+                repo: parsed.repo.into(),
+            })
+        });
+
+        Self {
+            commit,
+            commit_diff,
+            editor,
+            message,
+            message_expanded: false,
+            multibuffer,
+            project,
+            stash,
+            repository,
+            workspace,
+            remote,
+            ignore_whitespace_only_changes: false,
+            build_diff_task,
+        }
+    }
+
+    fn spawn_build_diff_task(
+        commit_diff: CommitDiff,
+        repository: Entity<Repository>,
+        project: Entity<Project>,
+        commit_sha: Arc<str>,
+        ignore_whitespace_only_changes: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Task<Result<()>> {
+        let language_registry = project.read(cx).languages().clone();
         let first_worktree_id = project
             .read(cx)
             .worktrees(cx)
             .next()
             .map(|worktree| worktree.read(cx).id());
-
-        let repository_clone = repository.clone();
 
         cx.spawn_in(window, async move |this, cx| {
             let mut binary_buffer_ids: HashSet<language::BufferId> = HashSet::default();
@@ -313,7 +364,12 @@ impl CommitView {
                     raw_new_text
                 };
                 let old_text = if is_binary { None } else { raw_old_text };
-                let worktree_id = repository_clone
+                let mut base_text = old_text.clone();
+                if let Some(base_text) = base_text.as_mut() {
+                    LineEnding::normalize(base_text);
+                }
+
+                let worktree_id = repository
                     .update(cx, |repository, cx| {
                         repository
                             .repo_path_to_project_path(&file.path, cx)
@@ -381,6 +437,17 @@ impl CommitView {
                         let mut hunks = diff_snapshot.hunks(&snapshot).peekable();
                         if hunks.peek().is_none() {
                             vec![language::Point::zero()..snapshot.max_point()]
+                        } else if ignore_whitespace_only_changes {
+                            base_text.as_ref().map_or_else(Vec::new, |base_text| {
+                                hunks
+                                    .filter(|hunk| {
+                                        !is_whitespace_only_commit_diff_hunk(
+                                            hunk, &snapshot, base_text,
+                                        )
+                                    })
+                                    .map(|hunk| hunk.buffer_range.to_point(&snapshot))
+                                    .collect::<Vec<_>>()
+                            })
                         } else {
                             hunks
                                 .map(|hunk| hunk.buffer_range.to_point(&snapshot))
@@ -390,7 +457,6 @@ impl CommitView {
                     (ranges, path)
                 })?;
 
-                // Batch the insertion of excerpts and yield between batches, to avoid blocking the main thread when a single file has many hunks.
                 const EXCERPT_BATCH_SIZE: usize = 10;
                 let total = excerpt_ranges.len();
                 let mut batch_end = 0;
@@ -404,7 +470,11 @@ impl CommitView {
                                 path.clone(),
                                 buffer.clone(),
                                 ranges,
-                                multibuffer_context_lines(cx),
+                                if ignore_whitespace_only_changes {
+                                    0
+                                } else {
+                                    multibuffer_context_lines(cx)
+                                },
                                 buffer_diff.clone(),
                                 cx,
                             );
@@ -440,34 +510,39 @@ impl CommitView {
 
             anyhow::Ok(())
         })
-        .detach();
+    }
 
-        let snapshot = repository.read(cx).snapshot();
-        let remote_url = snapshot
-            .remote_upstream_url
-            .as_ref()
-            .or(snapshot.remote_origin_url.as_ref());
-
-        let remote = remote_url.and_then(|url| {
-            let provider_registry = GitHostingProviderRegistry::default_global(cx);
-            parse_git_remote_url(provider_registry, url).map(|(host, parsed)| GitRemote {
-                host,
-                owner: parsed.owner.into(),
-                repo: parsed.repo.into(),
-            })
+    fn rebuild_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let buffer_ids = self
+            .multibuffer
+            .read(cx)
+            .all_buffers_iter()
+            .map(|buffer| buffer.read(cx).remote_id())
+            .collect::<Vec<_>>();
+        self.editor.update(cx, |editor, cx| {
+            for buffer_id in buffer_ids {
+                editor.remove_excerpts_for_buffer(buffer_id, cx);
+            }
         });
+        self.build_diff_task = Self::spawn_build_diff_task(
+            self.commit_diff.clone(),
+            self.repository.clone(),
+            self.project.clone(),
+            Arc::from(self.commit.sha.as_ref()),
+            self.ignore_whitespace_only_changes,
+            window,
+            cx,
+        );
+        cx.notify();
+    }
 
-        Self {
-            commit,
-            editor,
-            message,
-            message_expanded: false,
-            multibuffer,
-            stash,
-            repository,
-            workspace,
-            remote,
-        }
+    fn toggle_ignore_whitespace_only_changes(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.ignore_whitespace_only_changes = !self.ignore_whitespace_only_changes;
+        self.rebuild_diff(window, cx);
     }
 
     fn render_commit_avatar(
@@ -963,6 +1038,22 @@ async fn build_buffer(
     Ok(buffer)
 }
 
+fn is_whitespace_only_commit_diff_hunk(
+    diff_hunk: &DiffHunk,
+    buffer: &language::BufferSnapshot,
+    base_text: &str,
+) -> bool {
+    base_text
+        .get(diff_hunk.diff_base_byte_range.clone())
+        .unwrap_or("")
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .eq(buffer
+            .text_for_range(diff_hunk.buffer_range.clone())
+            .flat_map(|chunk| chunk.chars())
+            .filter(|character| !character.is_whitespace()))
+}
+
 async fn build_buffer_diff(
     mut old_text: Option<String>,
     buffer: &Entity<Buffer>,
@@ -1201,10 +1292,14 @@ impl Item for CommitView {
                 message_expanded: self.message_expanded,
                 multibuffer: self.multibuffer.clone(),
                 commit: self.commit.clone(),
+                commit_diff: self.commit_diff.clone(),
+                project,
                 stash: self.stash,
                 repository: self.repository.clone(),
                 workspace: self.workspace.clone(),
                 remote: self.remote.clone(),
+                ignore_whitespace_only_changes: self.ignore_whitespace_only_changes,
+                build_diff_task: Task::ready(Ok(())),
             }
         })))
     }
@@ -1235,6 +1330,19 @@ impl CommitViewToolbar {
     pub fn new() -> Self {
         Self { commit_view: None }
     }
+
+    fn toggle_ignore_whitespace_only_changes(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(commit_view) = self.commit_view.as_ref().and_then(|view| view.upgrade()) {
+            commit_view.update(cx, |commit_view, cx| {
+                commit_view.toggle_ignore_whitespace_only_changes(window, cx);
+            });
+            cx.notify();
+        }
+    }
 }
 
 impl EventEmitter<ToolbarItemEvent> for CommitViewToolbar {}
@@ -1251,6 +1359,7 @@ impl Render for CommitViewToolbar {
         let (additions, deletions) = commit_view_ref.calculate_changed_lines(cx);
 
         let commit_sha = commit_view_ref.commit.sha.clone();
+        let ignore_whitespace_only_changes = commit_view_ref.ignore_whitespace_only_changes;
 
         let remote_info = commit_view_ref.remote.as_ref().map(|remote| {
             let provider = remote.host.name();
@@ -1282,6 +1391,16 @@ impl Render for CommitViewToolbar {
                         .child(Divider::vertical()),
                 )
             })
+            .child(
+                IconButton::new("ignore-whitespace-only-changes", IconName::EyeOff)
+                    .icon_size(IconSize::Small)
+                    .toggle_state(ignore_whitespace_only_changes)
+                    .selected_style(ButtonStyle::Tinted(ui::TintColor::Accent))
+                    .tooltip(Tooltip::text("Hide whitespace-only changes"))
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.toggle_ignore_whitespace_only_changes(window, cx);
+                    })),
+            )
             .child(
                 IconButton::new("buffer-search", IconName::MagnifyingGlass)
                     .icon_size(IconSize::Small)
