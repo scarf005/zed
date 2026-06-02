@@ -1,0 +1,68 @@
+name: fork_macos_release
+
+on:
+  push:
+    branches: [build/git-ignore-whitespace-mac]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bundle_mac:
+    name: Bundle macOS (${{ matrix.suffix }})
+    runs-on: macos-15
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            suffix: aarch64
+          - target: x86_64-apple-darwin
+            suffix: x86_64
+    env:
+      CARGO_INCREMENTAL: 0
+      RUST_BACKTRACE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          clean: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build unsigned macOS DMG
+        run: ./script/bundle-mac ${{ matrix.target }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Zed-${{ matrix.suffix }}.dmg
+          path: target/${{ matrix.target }}/release/Zed-${{ matrix.suffix }}.dmg
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zed-remote-server-macos-${{ matrix.suffix }}.gz
+          path: target/zed-remote-server-macos-${{ matrix.suffix }}.gz
+          if-no-files-found: error
+
+  publish_release:
+    name: Publish fork release
+    needs: bundle_mac
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Create release with macOS artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="git-ignore-whitespace-mac-${GITHUB_RUN_NUMBER}"
+          mkdir -p release-artifacts
+          find artifacts -type f -maxdepth 2 -print -exec cp {} release-artifacts/ \;
+          gh release create "$tag" release-artifacts/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "Git ignore whitespace macOS build ${GITHUB_RUN_NUMBER}" \
+            --notes "Unsigned macOS build for Git panel whitespace diff filtering from ${GITHUB_SHA}."
