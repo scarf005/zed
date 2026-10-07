@@ -7139,6 +7139,7 @@ dependencies = [
  "tree-sitter-md",
  "ui",
  "ui_input",
+ "unicode-width 0.2.2",
  "unindent",
  "util",
  "watch",
