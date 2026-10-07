@@ -2657,6 +2657,41 @@ To interpret all `.c` files as C++, files called `MyLockFile` as TOML and files 
 }
 ```
 
+### Git Dates
+
+In the Settings Editor, open **Version Control** to set **Date Format** and each
+view's **Date Style**. The Git Panel's date style is under **Panels**.
+
+`git.date_format` controls absolute dates across Git views:
+
+- `"locale"` (default): keep each view's existing date format.
+- `"iso"`: `YYYY-MM-DD HH:MM`.
+- A [strftime format](https://man7.org/linux/man-pages/man3/strftime.3.html), such as
+  `"%Y-%m-%d %H:%M:%S %z"`.
+
+Dates use your local time zone. Empty or invalid formats fall back to `"locale"`.
+Hovers, tooltips, and commit views always show absolute dates using this format.
+
+Each view has its own `date_style`, either `"relative"` or `"absolute"`. The default
+is `"relative"` for blame, inline blame (including the status bar), branch and stash
+pickers, and Git Panel history. Git Graph rows default to `"absolute"`.
+
+Or add this to your settings.json:
+
+```json [settings]
+{
+  "git": {
+    "date_format": "%Y-%m-%d %H:%M",
+    "blame": { "date_style": "relative" },
+    "inline_blame": { "date_style": "relative" },
+    "branch_picker": { "date_style": "relative" },
+    "stash_picker": { "date_style": "relative" }
+  },
+  "git_panel": { "date_style": "relative" },
+  "git_graph": { "date_style": "absolute" }
+}
+```
+
 ### Git Gutter
 
 - Description: Whether or not to show the git gutter.
