@@ -13931,6 +13931,7 @@ dependencies = [
  "tempfile",
  "terminal",
  "text",
+ "time",
  "toml 0.9.8",
  "tracing",
  "unindent",
