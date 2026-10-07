@@ -7,6 +7,7 @@ use workspace::{Toast, notifications::NotificationId};
 mod blame_ui;
 pub mod clone;
 
+use crate::git_timestamp::format_git_date;
 use git::{
     Oid,
     repository::{Branch, CommitDetails, Upstream, UpstreamTracking, UpstreamTrackingStatus},
@@ -18,8 +19,9 @@ use gpui::{
 };
 use menu::{Cancel, Confirm};
 use notifications::status_toast::StatusToast;
-use project::git_store::Repository;
+use project::{git_store::Repository, project_settings::ProjectSettings};
 use project_diff::ProjectDiff;
+use settings::Settings;
 use time::OffsetDateTime;
 use ui::{ButtonLike, ContextMenu, ElevationIndex, PopoverMenuHandle, TintColor, prelude::*};
 use util::ResultExt as _;
@@ -49,6 +51,7 @@ pub mod git_panel;
 mod git_panel_settings;
 pub mod git_picker;
 mod git_runtime_diagnostics;
+mod git_timestamp;
 pub mod multi_diff_view;
 pub mod picker_prompt;
 pub mod project_diff;
@@ -869,13 +872,10 @@ impl Render for RefPickerModal {
         let commit_preview = self.commit_details.as_ref().map(|details| {
             let commit_time = OffsetDateTime::from_unix_timestamp(details.commit_timestamp)
                 .unwrap_or_else(|_| OffsetDateTime::now_utc());
-            let local_offset =
-                time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC);
-            let formatted_time = time_format::format_localized_timestamp(
+            let formatted_time = format_git_date(
                 commit_time,
-                OffsetDateTime::now_utc(),
-                local_offset,
-                time_format::TimestampFormat::Relative,
+                ProjectSettings::get_global(cx).git.branch_picker.date_style,
+                cx,
             );
 
             let subject = details.message.lines().next().unwrap_or("").to_string();
@@ -1502,7 +1502,7 @@ mod view_commit_tests {
     use project::project_settings::ProjectSettings;
     use project::{FakeFs, Project, WorktreeSettings};
     use serde_json::json;
-    use settings::{Settings as _, SettingsStore};
+    use settings::SettingsStore;
     use std::path::Path;
     use std::sync::Arc;
     use theme::LoadThemes;
